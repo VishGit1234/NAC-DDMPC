@@ -43,7 +43,7 @@ class ReplayBuffer:
 
 
 
-def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
@@ -222,7 +222,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         #               Q2Vals=q2.detach().numpy())
 
         loss_q = -(policy_grad + v_grad)
-        return torch.mean(loss_q)
+        return torch.mean(torch.square(loss_q))
         # return loss_q, q_info
 
     # Set up function for computing SAC pi loss
@@ -253,6 +253,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         q_optimizer.zero_grad()
         loss_q = compute_loss_q(data)
         loss_q.backward()
+        for _, param in ac.named_parameters():
+            assert not torch.any(torch.isnan(param.grad)), "Some gradients are NaN"
         q_optimizer.step()
 
         # Record things
@@ -298,6 +300,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 ep_ret += r
                 ep_len += 1
             # logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        return ep_ret, ep_len
             
     def train():
         # Prepare for interaction with environment
@@ -362,7 +365,8 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     # logger.save_state({'env': env}, None)
 
                 # Test the performance of the deterministic version of the agent.
-                test_agent()
+                ep_ret, ep_len = test_agent()
+                print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_re}")
 
                 # Log info about epoch
                 # logger.log_tabular('Epoch', epoch)
