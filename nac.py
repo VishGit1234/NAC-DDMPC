@@ -164,6 +164,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     ac = actor_critic(obs_dim, act_dim, **ac_kwargs)
     ac_targ = deepcopy(ac)
 
+    torch.autograd.set_detect_anomaly(True)
+
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
     for p in ac_targ.parameters():
         p.requires_grad = False
@@ -200,11 +202,12 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         #     q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
         #     backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
 
-        v = alpha*torch.log(torch.sum(torch.exp(q/alpha)))
+        v = alpha*torch.log(torch.exp(q/alpha).sum(-1, keepdim=True))
         with torch.no_grad():
             # We obtain V(s') from target network
             v_o2 = alpha*torch.log(torch.exp(ac_targ.q(o2)/alpha).sum(-1))
-            policy = torch.exp((q - v)/alpha)
+            v_expanded = v.expand_as(q)
+            policy = torch.exp((q - v_expanded)/alpha)
             q_targ = r + gamma*v_o2
             v_targ = q_targ.mean(-1) + (-alpha*torch.log(policy)).mean(-1)
             rows = torch.arange(q.shape[0]).unsqueeze(1)
@@ -222,7 +225,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         #               Q2Vals=q2.detach().numpy())
 
         loss_q = -(policy_grad + v_grad)
-        return torch.mean(torch.square(loss_q))
+        return torch.mean(loss_q)
         # return loss_q, q_info
 
     # Set up function for computing SAC pi loss
@@ -366,7 +369,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
                 # Test the performance of the deterministic version of the agent.
                 ep_ret, ep_len = test_agent()
-                print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_re}")
+                print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_ret}")
 
                 # Log info about epoch
                 # logger.log_tabular('Epoch', epoch)
