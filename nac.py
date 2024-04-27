@@ -4,8 +4,12 @@ import numpy as np
 import torch
 from torch.optim import Adam
 import core
+import math
 # import gym
 import time
+from timeit import default_timer
+
+from kernel import adaptive_isotropic_gaussian_kernel
 # import spinup.algos.pytorch.sac.core as core
 # from spinup.utils.logx import EpochLogger
 
@@ -45,7 +49,7 @@ class ReplayBuffer:
 
 def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
+        polyak=0.995, lr=1e-5, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
         logger_kwargs=dict(), save_freq=1):
     """
@@ -153,12 +157,13 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     env, test_env = env_fn(), env_fn()
     obs_dim = env.observation_space.shape[0]
-    # Actions must be discrete (for now)
-    # act_dim = env.action_space.shape[0]
-    act_dim = env.action_space.n
+    act_dim = env.action_space.shape[0]
+
+    # act_dim = env.action_space.n
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    # act_limit = env.action_space.high[0]
+    act_high = env.action_space.high[0]
+    act_low = env.action_space.low[0]
 
     # Create actor-critic module and target networks
     ac = actor_critic(obs_dim, act_dim, **ac_kwargs)
@@ -170,8 +175,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     for p in ac_targ.parameters():
         p.requires_grad = False
         
-    # List of parameters for both Q-networks (save this for convenience)
-    q_params = ac.q.parameters()
+    # List of parameters for both networks
     # q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
     # Experience buffer
@@ -186,79 +190,121 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        # q is a vector of q values for each action
-        q = ac.q(o)
-        # q1 = ac.q1(o,a)
-        # q2 = ac.q2(o,a)
+        # Calculate value for each state in mini-batch using importance sampling derived formula
+        n_samples = 8 # Number of samples for sample mean
+        q_samples = []
+        for i in range(n_samples):
+            # sample actions from q_a' (assumed as current policy)
+            _a, _ = ac.a(o)
+            # Compute q-value of this state-action pair
+            _q = ac.q(o, _a)
+            q_samples.append(_q)
+        # Shape should be B x N_SAMPLES
+        q_samples = torch.stack(q_samples, dim=1)
 
-        # Bellman backup for Q functions
-        # with torch.no_grad():
-        #     # Target actions come from *current* policy
-        #     a2, logp_a2 = ac.act(o2)
+        # Compute values of current states (I think dividing by q_ai(ai) can be ignored)
+        # alpha*(LSE(q/a) - log(N))
+        # Using torch operations for differentiability
+        v = torch.mul(torch.sub(torch.logsumexp(q_samples/alpha, dim=1), math.log(n_samples)), alpha)
 
-        #     # Target Q-values
-        #     q1_pi_targ = ac_targ.q1(o2, a2)
-        #     q2_pi_targ = ac_targ.q2(o2, a2)
-        #     q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-        #     backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
+        # Get q-value estimates for all state-action pairs in mini-batch
+        q = ac.q(o, a)
 
-        v = alpha*torch.log(torch.exp(q/alpha).sum(-1, keepdim=True))
+        # Compute Q target and V target
         with torch.no_grad():
-            # We obtain V(s') from target network
-            v_o2 = alpha*torch.log(torch.exp(ac_targ.q(o2)/alpha).sum(-1))
-            v_expanded = v.expand_as(q)
-            policy = torch.exp((q - v_expanded)/alpha)
-            q_targ = r + gamma*v_o2
-            v_targ = q_targ.mean(-1) + (-alpha*torch.log(policy)).mean(-1)
-            rows = torch.arange(q.shape[0]).unsqueeze(1)
-        a = a.int()
-        policy_grad = ((q[rows, a] - v)*(q[rows, a] - q_targ)).mean(-1)
-        v_grad = (0.5*(v - v_targ)**2).mean(-1)
+            q_samples2 = []
+            logps = []
+            for i in range(n_samples):
+                # sample actions from q_a' (assumed as current policy)
+                _a2, _logp = ac_targ.a(o2, True)
+                # Compute q-value of this state-action pair
+                _q2 = ac_targ.q(o2, _a2)
+                q_samples2.append(_q2)
+                logps.append(_logp)
+            # Shape should be B x N_SAMPLES
+            q_samples2 = torch.stack(q_samples2, dim=1)
+            logps = torch.stack(logps, dim=1)
 
-        # MSE loss against Bellman backup
-        # loss_q1 = ((q1 - backup)**2).mean()
-        # loss_q2 = ((q2 - backup)**2).mean()
-        # loss_q = loss_q1 + loss_q2
+            # Compute value of next state
+            v2 = torch.logsumexp(q_samples2/alpha, dim=1)
+            v2 -= math.log(n_samples)
+            v2 *= alpha
 
-        # # Useful info for logging
-        # q_info = dict(Q1Vals=q1.detach().numpy(),
-        #               Q2Vals=q2.detach().numpy())
+            # Compute targets
+            q_targ = torch.unsqueeze(r, dim=-1) + gamma*v2
+            v_targ = q_samples2.mean(dim=1) + alpha*torch.unsqueeze(logps.mean(dim=1), dim=-1)
+
+        # Calculate gradients
+        policy_grad = ((q - v)*(q - q_targ)).mean(dim=-1)
+        v_grad = torch.div(torch.square(v - v_targ), 2).mean(dim=-1)
 
         loss_q = -(policy_grad + v_grad)
         return torch.mean(loss_q)
-        # return loss_q, q_info
 
-    # Set up function for computing SAC pi loss
-    # def compute_loss_pi(data):
-    #     o = data['obs']
-    #     pi, logp_pi = ac.pi(o)
-    #     q1_pi = ac.q1(o, pi)
-    #     q2_pi = ac.q2(o, pi)
-    #     q_pi = torch.min(q1_pi, q2_pi)
+    # Set up function for computing SAC actor loss
+    def compute_loss_a(data):
+        o = data['obs']
 
-    #     # Entropy-regularized policy loss
-    #     loss_pi = (alpha * logp_pi - q_pi).mean()
+        n_samples = 8
+        n_fixed_actions = n_samples // 2
+        fixed_actions = []
+        for i in range(n_fixed_actions):
+            fixed_action, _ = ac.a(o)
+            fixed_actions.append(fixed_action)
+        fixed_actions = torch.stack(fixed_actions, dim=1)
 
-    #     # Useful info for logging
-    #     pi_info = dict(LogPi=logp_pi.detach().numpy())
+        updated_actions = []
+        n_updated_actions = n_samples - n_fixed_actions
+        for i in range(n_updated_actions):
+            updated_action, _ = ac.a(o)
+            updated_actions.append(updated_action)
+        updated_actions = torch.stack(updated_actions, dim=1)
 
-    #     return loss_pi, pi_info
+        # flatten first 2 dims to input into network
+        repeat_sizes = [1] * len(o.shape)
+        repeat_sizes[0] *= n_fixed_actions
+        svgd_target_values = ac.q(o.repeat(repeat_sizes), torch.flatten(fixed_actions, end_dim=1))
+        svgd_target_values = torch.reshape(svgd_target_values, (o.shape[0], n_fixed_actions, act_dim))
+        squash_correction = torch.sum(torch.log(torch.add(torch.neg(torch.square(fixed_actions)), 1 + 1e-6)), dim=-1)
+        squash_correction = torch.unsqueeze(squash_correction, dim=-1)
+        log_p = svgd_target_values + squash_correction
+        
+        grad_log_p = torch.autograd.grad(log_p, fixed_actions, torch.ones(batch_size, n_fixed_actions, 1), retain_graph=True)[0]
+        grad_log_p = torch.unsqueeze(grad_log_p, dim=2)
+        grad_log_p.requires_grad = False
 
-    # Set up optimizers for policy and q-function
-    # pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
-    q_optimizer = Adam(q_params, lr=lr)
+        kernel_dict = adaptive_isotropic_gaussian_kernel(xs=fixed_actions, ys=updated_actions)
+
+        # Kernel function in Equation 13:
+        kappa = torch.unsqueeze(kernel_dict["output"], dim=3)
+
+        # Stein Variational Gradient in Equation 13:
+        action_gradients = torch.mean(
+            kappa * grad_log_p + kernel_dict["gradient"], dim=1)
+
+        # This computes our gradients
+        # updated_actions.retain_grad()
+        updated_actions.backward(action_gradients)
+        # print(updated_actions)
+
+    # Set up optimizers for action-sampler and q-function
+    q_optimizer = Adam(ac.q.parameters(), lr=lr)
+    a_optimizer = Adam(ac.a.parameters(), lr=lr)
 
     # Set up model saving
     # logger.setup_pytorch_saver(ac)
 
     def update(data):
-        # First run one gradient descent step for Q1 and Q2
+        # First run one gradient descent step for Q and A
         q_optimizer.zero_grad()
+        a_optimizer.zero_grad()
         loss_q = compute_loss_q(data)
         loss_q.backward()
-        for _, param in ac.named_parameters():
+        compute_loss_a(data)
+        for _, param in ac.q.named_parameters():
             assert not torch.any(torch.isnan(param.grad)), "Some gradients are NaN"
         q_optimizer.step()
+        a_optimizer.step()
 
         # Record things
         # logger.store(LossQ=loss_q.item(), **q_info)
@@ -309,8 +355,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # Prepare for interaction with environment
         total_steps = steps_per_epoch * epochs
         start_time = time.time()
-        o, ep_ret, ep_len = env.reset(), 0, 0
-        o = o[0]
+        o, _ = env.reset()
+        ep_ret, ep_len = 0, 0
 
         # Main loop: collect experience in env and update/log each epoch
         for t in range(total_steps):
@@ -347,8 +393,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             # End of trajectory handling
             if d or (ep_len == max_ep_len):
                 # logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, ep_ret, ep_len = env.reset(), 0, 0
-                o = o[0]
+                o, _ = env.reset()
+                ep_ret, ep_len = 0, 0
 
             # Update handling
             if t >= update_after and t % update_every == 0:
