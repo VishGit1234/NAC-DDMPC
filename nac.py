@@ -192,15 +192,12 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Calculate value for each state in mini-batch using importance sampling derived formula
         n_samples = 8 # Number of samples for sample mean
-        q_samples = []
-        for i in range(n_samples):
-            # sample actions from q_a' (assumed as current policy)
-            _a, _ = ac.a(o)
-            # Compute q-value of this state-action pair
-            _q = ac.q(o, _a)
-            q_samples.append(_q)
-        # Shape should be B x N_SAMPLES
-        q_samples = torch.stack(q_samples, dim=1)
+        o_samples = torch.unsqueeze(o, 1).repeat(1, n_samples, *([1]*len(o.shape[1:])))
+        o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
+        a_samples, _ = ac.a(o_samples)
+        q_samples = ac.q(o_samples, a_samples)
+        # Reshape to B x num_samples
+        q_samples = q_samples.reshape(batch_size, n_samples)
 
         # Compute values of current states (I think dividing by q_ai(ai) can be ignored)
         # alpha*(LSE(q/a) - log(N))
@@ -212,18 +209,12 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Compute Q target and V target
         with torch.no_grad():
-            q_samples2 = []
-            logps = []
-            for i in range(n_samples):
-                # sample actions from q_a' (assumed as current policy)
-                _a2, _logp = ac_targ.a(o2, True)
-                # Compute q-value of this state-action pair
-                _q2 = ac_targ.q(o2, _a2)
-                q_samples2.append(_q2)
-                logps.append(_logp)
-            # Shape should be B x N_SAMPLES
-            q_samples2 = torch.stack(q_samples2, dim=1)
-            logps = torch.stack(logps, dim=1)
+            o2_samples = torch.unsqueeze(o2, 1).repeat(1, n_samples, *([1]*len(o2.shape[1:])))
+            o2_samples = o2_samples.reshape(o2_samples.shape[0] * o2_samples.shape[1], *o2_samples.shape[2:])
+            a_samples2, logps = ac.a(o2_samples, True)
+            logps = logps.reshape(batch_size, n_samples)
+            q_samples2 = ac.q(o2_samples, a_samples2)
+            q_samples2 = q_samples2.reshape(batch_size, n_samples)
 
             # Compute value of next state
             v2 = torch.logsumexp(q_samples2/alpha, dim=1)
@@ -248,17 +239,16 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         n_samples = 8
         n_fixed_actions = n_samples // 2
         fixed_actions = []
-        for i in range(n_fixed_actions):
-            fixed_action, _ = ac.a(o)
-            fixed_actions.append(fixed_action)
-        fixed_actions = torch.stack(fixed_actions, dim=1)
+        o_samples = torch.unsqueeze(o, 1).repeat(1, n_fixed_actions, *([1]*len(o.shape[1:])))
+        o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
+        fixed_actions, _ = ac.a(o_samples)
+        fixed_actions = fixed_actions.reshape(batch_size, n_fixed_actions).unsqueeze(-1)
 
-        updated_actions = []
         n_updated_actions = n_samples - n_fixed_actions
-        for i in range(n_updated_actions):
-            updated_action, _ = ac.a(o)
-            updated_actions.append(updated_action)
-        updated_actions = torch.stack(updated_actions, dim=1)
+        o_samples2 = torch.unsqueeze(o, 1).repeat(1, n_updated_actions, *([1]*len(o.shape[1:])))
+        o_samples2 = o_samples2.reshape(o_samples2.shape[0] * o_samples2.shape[1], *o_samples2.shape[2:])
+        updated_actions, _ = ac.a(o_samples2)
+        updated_actions = updated_actions.reshape(batch_size, n_updated_actions).unsqueeze(-1)
 
         # flatten first 2 dims to input into network
         repeat_sizes = [1] * len(o.shape)
