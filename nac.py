@@ -275,7 +275,18 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # This computes our gradients
         # updated_actions.retain_grad()
         updated_actions.backward(action_gradients)
-        # print(updated_actions)
+
+        # Calculate surrogate loss
+        surrogate_loss = 0
+        layers = 0
+        for w in ac.a.parameters():
+            surrogate_loss += torch.mean(w*w.grad.detach())
+            layers += 1
+        surrogate_loss /= layers
+
+        ac.a.zero_grad()
+
+        return surrogate_loss
 
     # Set up optimizers for action-sampler and q-function
     q_optimizer = Adam(ac.q.parameters(), lr=lr)
@@ -290,9 +301,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         a_optimizer.zero_grad()
         loss_q = compute_loss_q(data)
         loss_q.backward()
-        compute_loss_a(data)
-        for _, param in ac.q.named_parameters():
-            assert not torch.any(torch.isnan(param.grad)), "Some gradients are NaN"
+        loss_a = compute_loss_a(data)
+        loss_a.backward
         q_optimizer.step()
         a_optimizer.step()
 
