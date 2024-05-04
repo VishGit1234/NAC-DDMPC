@@ -51,7 +51,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-5, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1):
+        logger_kwargs=dict(), save_freq=1, realtime=False):
     """
     Soft Actor-Critic (SAC)
 
@@ -147,15 +147,24 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
 
+        realtime (bool): Wheather to run the simulation in realtime or not, (set to false for faster training)
+
     """
 
     # logger = EpochLogger(**logger_kwargs)
     # logger.save_config(locals())
+    
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     env, test_env = env_fn(), env_fn()
+    #uncap env fps
+
+    if not realtime:
+        env.metadata['render_fps'] = 0
+
+
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
 
