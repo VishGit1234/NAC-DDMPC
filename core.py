@@ -24,7 +24,7 @@ def count_vars(module):
 
 
 LOG_STD_MAX = 2
-LOG_STD_MIN = -20
+LOG_STD_MIN = -15
 
 class MLPQFunction(nn.Module):
 
@@ -100,4 +100,4 @@ class MLPActorCritic(nn.Module):
         with torch.no_grad():
             # sample an action
             a, _ = self.a(obs)
-            return a.numpy()
+            return a.cpu().numpy()
