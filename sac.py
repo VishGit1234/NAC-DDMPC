@@ -1,11 +1,13 @@
 from copy import deepcopy
 import itertools
+from timeit import default_timer
 import numpy as np
 import torch
 from torch.optim import Adam
 import gymnasium
 import time
 import sac_core
+from stable_baselines3.common.vec_env import SubprocVecEnv
 # from spinup.utils.logx import EpochLogger
 
 
@@ -42,8 +44,8 @@ class ReplayBuffer:
 
 
 
-def sac(env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
+def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+        steps_per_epoch=5000, epochs=4, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
         logger_kwargs=dict(), save_freq=1, realtime = False):
@@ -153,18 +155,20 @@ def sac(env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env, test_env = env_fn(), env_fn()
-    obs_dim = env.observation_space.shape
-    act_dim = env.action_space.shape[0]
+    test_env = env_fn()
+    envs = SubprocVecEnv([env_fn for _ in range(num_envs)])
+    obs_dim = envs.observation_space.shape
+    act_dim = envs.action_space.shape[0]
 
     if not realtime:
-        env.metadata['render_fps'] = 0
+        envs.set_attr('render_fps', 0)#['render_fps'] = 0
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    act_limit = env.action_space.high[0]
+    act_limit = envs.action_space.high[0]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac = actor_critic(envs.observation_space, envs.action_space, **ac_kwargs)
+    # ac.load_state_dict(torch.load('sac'))
     ac_targ = deepcopy(ac)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
@@ -285,12 +289,14 @@ def sac(env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             # logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
         return ep_ret, ep_len
 
+    # test_agent()
+    # return
+
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    o, _ = env.reset()
-    ep_ret, ep_len = 0, 0
-
+    o = envs.reset()
+    ep_ret, ep_len = np.zeros((num_envs,)), np.zeros((num_envs,))
     # Main loop: collect experience in env and update/log each epoch
     for t in range(total_steps):
         
@@ -300,30 +306,34 @@ def sac(env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         if t > start_steps:
             a = get_action(o)
         else:
-            a = env.action_space.sample()
+            a = np.array([envs.action_space.sample() for _ in range(num_envs)])
 
         # Step the env
-        o2, r, d, _, _ = env.step(a)
+        o2, r, d, _ = envs.step(a)
         ep_ret += r
         ep_len += 1
 
         # Ignore the "done" signal if it comes from hitting the time
         # horizon (that is, when it's an artificial terminal signal
         # that isn't based on the agent's state)
-        d = False if ep_len==max_ep_len else d
+        # d = False if ep_len==max_ep_len else d
 
         # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
+        [replay_buffer.store(_o, _a, _r, _o2, _d) for _o, _a, _r, _o2, _d in zip(o, a, r, o2, d)]
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!
         o = o2
 
         # End of trajectory handling
-        if d or (ep_len == max_ep_len):
-            # logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, _ = env.reset()
-            ep_ret, ep_len = 0, 0
+        for env_idx, _d in enumerate(d):
+            if _d:
+                ep_len[env_idx] = 0
+                ep_ret[env_idx] = 0
+        # if d or (ep_len == max_ep_len):
+        #     # logger.store(EpRet=ep_ret, EpLen=ep_len)
+        #     o = envs.reset()
+        #     ep_ret, ep_len = 0, 0
 
         # Update handling
         if t >= update_after and t % update_every == 0:
@@ -343,6 +353,7 @@ def sac(env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             # Test the performance of the deterministic version of the agent.
             ep_ret, ep_len = test_agent()
             print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_ret}")
+            ep_ret, ep_len = np.zeros((num_envs,)), np.zeros((num_envs,))
 
             # Log info about epoch
             # logger.log_tabular('Epoch', epoch)

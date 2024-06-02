@@ -8,8 +8,9 @@ import math
 # import gym
 import time
 from timeit import default_timer
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from kernel import adaptive_isotropic_gaussian_kernel as adaptive_isotropic_gaussian_kernel
+from kernel import adaptive_isotropic_gaussian_kernel_stable as adaptive_isotropic_gaussian_kernel_stable
 # import spinup.algos.pytorch.sac.core as core
 # from spinup.utils.logx import EpochLogger
 
@@ -47,7 +48,7 @@ class ReplayBuffer:
 
 
 
-def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-5, alpha=0.4, batch_size=100, start_steps=10000, 
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
@@ -158,27 +159,24 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env, test_env = env_fn(), env_fn()
-    #uncap env fps
+    test_env = env_fn()
+    envs = SubprocVecEnv([env_fn for _ in range(num_envs)])
+    obs_dim = envs.observation_space.shape
+    act_dim = envs.action_space.shape[0]
 
     if not realtime:
-        env.metadata['render_fps'] = 0
+        envs.set_attr('render_fps', 0)#['render_fps'] = 0
 
-
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    # act_dim = env.action_space.n
 
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    act_high = env.action_space.high[0]
-    act_low = env.action_space.low[0]
+    act_high = envs.action_space.high[0]
+    act_low = envs.action_space.low[0]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(obs_dim, act_dim, **ac_kwargs)
+    ac = actor_critic(envs.observation_space.shape, envs.action_space.shape, **ac_kwargs)
     ac_targ = deepcopy(ac)
 
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
     for p in ac_targ.parameters():
@@ -200,7 +198,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
         # Calculate value for each state in mini-batch using importance sampling derived formula
-        n_samples = # Number of samples for sample mean
+        n_samples = batch_size # Number of samples for sample mean
+        # duplicate o_samples based on number of samples
         o_samples = torch.unsqueeze(o, 1).repeat(1, n_samples, *([1]*len(o.shape[1:])))
         o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
         a_samples, _ = ac.a(o_samples)
@@ -241,7 +240,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         loss_q = -(policy_grad + v_grad)
         return torch.mean(loss_q)
 
-    # Set up function for computing SAC actor loss
+    # Set up function for computing NAC actor loss
     def compute_loss_a(data):
         o = data['obs']
         
@@ -287,7 +286,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
 
 
-        kernel_dict = adaptive_isotropic_gaussian_kernel(xs=fixed_actions, ys=updated_actions)
+        kernel_dict = adaptive_isotropic_gaussian_kernel_stable(xs=fixed_actions, ys=updated_actions)
 
         # Kernel function in Equation 13:
         kappa = torch.unsqueeze(kernel_dict["output"], dim=3)
@@ -339,13 +338,21 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def update(data):
         # First run one gradient descent step for Q and A
         q_optimizer.zero_grad()
-        a_optimizer.zero_grad()
         loss_q = compute_loss_q(data)
         loss_q.backward()
+        q_optimizer.step()
+
+        # Freeze Q-networks so you don't waste computational effort 
+        # computing gradients for them during the policy learning step.
+        for p in ac.q.parameters():
+            p.requires_grad = False
         loss_a = compute_loss_a(data)
         loss_a.backward()
         q_optimizer.step()
         a_optimizer.step()
+        # Unfreeze Q-networks so you can optimize it at next DDPG step.
+        for p in ac.q.parameters():
+            p.requires_grad = True
 
         # Record things
         # logger.store(LossQ=loss_q.item(), **q_info)
@@ -397,8 +404,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # Prepare for interaction with environment
         total_steps = steps_per_epoch * epochs
         start_time = time.time()
-        o, _ = env.reset()
-        ep_ret, ep_len = 0, 0
+        o = envs.reset()
+        ep_ret, ep_len = np.zeros((num_envs,)), np.zeros((num_envs,))
 
         # Main loop: collect experience in env and update/log each epoch
         for t in range(total_steps):
@@ -411,32 +418,33 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             else:
                 # Query expert demonstrator
                 # raise NotImplementedError
-                a = env.action_space.sample()
+                a = np.array([envs.action_space.sample() for _ in range(num_envs)])
 
             # Step the env
-            o2, r, d, _, _ = env.step(a)
+            o2, r, d, _ = envs.step(a)
             ep_ret += r
             ep_len += 1
 
             # Ignore the "done" signal if it comes from hitting the time
             # horizon (that is, when it's an artificial terminal signal
             # that isn't based on the agent's state)
-            d = False if ep_len==max_ep_len else d
+            # d = False if ep_len==max_ep_len else d
 
             # Store experience to replay buffer or demonstrations
             if t > start_steps:
-                replay_buffer.store(o, a, r, o2, d)
+                [replay_buffer.store(_o, _a, _r, _o2, _d) for _o, _a, _r, _o2, _d in zip(o, a, r, o2, d)]
             else:
-                demonstrations.store(o, a, r, o2, d)
+                # [demonstrations.store(_o, _a, _r, _o2, _d) for _o, _a, _r, _o2, _d in zip(o, a, r, o2, d)]
+                [replay_buffer.store(_o, _a, _r, _o2, _d) for _o, _a, _r, _o2, _d in zip(o, a, r, o2, d)]
             # Super critical, easy to overlook step: make sure to update 
             # most recent observation!
             o = o2
 
             # End of trajectory handling
-            if d or (ep_len == max_ep_len):
-                # logger.store(EpRet=ep_ret, EpLen=ep_len)
-                o, _ = env.reset()
-                ep_ret, ep_len = 0, 0
+            for env_idx, _d in enumerate(d):
+                if _d:
+                    ep_len[env_idx] = 0
+                    ep_ret[env_idx] = 0
 
             # Update handling
             if t >= update_after and t % update_every == 0:
@@ -444,7 +452,8 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     if t > start_steps:
                         batch = replay_buffer.sample_batch(batch_size)
                     else:
-                        batch = demonstrations.sample_batch(batch_size)
+                        # batch = demonstrations.sample_batch(batch_size)
+                        batch = replay_buffer.sample_batch(batch_size)
                     update(data=batch)
 
             # End of epoch handling
@@ -458,27 +467,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 # Test the performance of the deterministic version of the agent.
                 ep_ret, ep_len, d = test_agent()
                 print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_ret}, Successful: {d}")
+                ep_ret, ep_len = np.zeros((num_envs,)), np.zeros((num_envs,))
     
     # test_agent()
     train()
-
-# if __name__ == '__main__':
-#     import argparse
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--env', type=str, default='HalfCheetah-v2')
-#     parser.add_argument('--hid', type=int, default=256)
-#     parser.add_argument('--l', type=int, default=2)
-#     parser.add_argument('--gamma', type=float, default=0.99)
-#     parser.add_argument('--seed', '-s', type=int, default=0)
-#     parser.add_argument('--epochs', type=int, default=50)
-#     parser.add_argument('--exp_name', type=str, default='sac')
-#     args = parser.parse_args()
-
-#     # from spinup.utils.run_utils import setup_logger_kwargs
-#     # logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
-
-#     torch.set_num_threads(torch.get_num_threads())
-
-#     sac(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
-#         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
-#         gamma=args.gamma, seed=args.seed, epochs=args.epochs)

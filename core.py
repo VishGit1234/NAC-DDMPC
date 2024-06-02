@@ -89,12 +89,9 @@ class MLPActorCritic(nn.Module):
                  activation=nn.ReLU):
         super().__init__()
 
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-
         # build q function and action sampling function
-        self.q = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
-        self.a = MLPActionSampler(obs_dim, act_dim, hidden_sizes, nn.ReLU)
+        self.q = MLPQFunction(obs_dim[0], act_dim[0], hidden_sizes, activation)
+        self.a = MLPActionSampler(obs_dim[0], act_dim[0], hidden_sizes, nn.ReLU)
 
     def act(self, obs, deterministic=False, alpha=0.2):
         with torch.no_grad():
