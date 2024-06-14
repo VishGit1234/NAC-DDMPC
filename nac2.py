@@ -178,7 +178,7 @@ def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     act_low = env.action_space.low[0]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(obs_dim, act_dim, **ac_kwargs)
+    ac = actor_critic(env.observation_space, env.action_space.shape, **ac_kwargs)
     ac_targ = deepcopy(ac)
 
     torch.autograd.set_detect_anomaly(True)

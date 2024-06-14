@@ -97,4 +97,4 @@ class MLPActorCritic(nn.Module):
         with torch.no_grad():
             # sample an action
             a, _ = self.a(obs)
-            return a.cpu().numpy()
+            return a

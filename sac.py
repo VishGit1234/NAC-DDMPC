@@ -275,7 +275,7 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
 
     def get_action(o, deterministic=False):
         return ac.act(torch.as_tensor(o, dtype=torch.float32), 
-                      deterministic)
+                      deterministic).detach().cpu().numpy()
 
     def test_agent():
         for j in range(num_test_episodes):

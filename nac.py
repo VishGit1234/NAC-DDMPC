@@ -198,7 +198,7 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
         # Calculate value for each state in mini-batch using importance sampling derived formula
-        n_samples = batch_size # Number of samples for sample mean
+        n_samples = 16 # Number of samples for sample mean
         # duplicate o_samples based on number of samples
         o_samples = torch.unsqueeze(o, 1).repeat(1, n_samples, *([1]*len(o.shape[1:])))
         o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
@@ -239,6 +239,30 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
 
         loss_q = -(policy_grad + v_grad)
         return torch.mean(loss_q)
+    
+    # Just for comparing loss
+    def compute_loss_q_sac(data):
+        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+
+        q1 = ac.q(o,a)
+
+        # Bellman backup for Q functions
+        with torch.no_grad():
+            # Target actions come from *current* policy
+            a2, logp_a2 = ac.a(o2, with_logprob=True)
+
+            # Target Q-values
+            q_pi_targ = ac_targ.q(o2, a2)
+            backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
+
+        # MSE loss against Bellman backup
+        loss_q = ((q1 - backup)**2).mean()
+
+        # Useful info for logging
+        # q_info = dict(Q1Vals=q1.detach().numpy(),
+        #               Q2Vals=q2.detach().numpy())
+
+        return loss_q
 
     # Set up function for computing NAC actor loss
     def compute_loss_a(data):
@@ -247,30 +271,42 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
         # Check values of observation tensor
        # print("Observation tensor:", o)
 
-        n_samples = batch_size
-        n_fixed_actions = n_samples // 2
-        fixed_actions = []
-        o_samples = torch.unsqueeze(o, 1).repeat(1, n_fixed_actions, *([1]*len(o.shape[1:])))
+        n_samples = 16
+        o_samples = torch.unsqueeze(o, 1).repeat(1, n_samples, *([1]*len(o.shape[1:])))
         o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
-        fixed_actions, _ = ac.a(o_samples)
-        fixed_actions = fixed_actions.reshape(batch_size, n_fixed_actions).unsqueeze(-1)
+        actions, _ = ac.a(o_samples)
+        actions = actions.reshape(batch_size, n_samples)  
+        n_updated_actions = int(n_samples * 0.5)
+        n_fixed_actions = n_samples - n_updated_actions
+
+        fixed_actions, updated_actions = torch.split(actions, [n_fixed_actions, n_updated_actions], dim=1)
+        fixed_actions = fixed_actions.clone().detach().requires_grad_(True)
+        fixed_actions = fixed_actions.unsqueeze(dim=-1)
+        updated_actions = updated_actions.unsqueeze(dim=-1)
+
+        # n_fixed_actions = n_samples // 2
+        # fixed_actions = []
+        # o_samples = torch.unsqueeze(o, 1).repeat(1, n_fixed_actions, *([1]*len(o.shape[1:])))
+        # o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
+        # fixed_actions, _ = ac.a(o_samples)
+        # fixed_actions = fixed_actions.reshape(batch_size, n_fixed_actions).unsqueeze(-1)
 
         # Check values of fixed actions tensor
        # print("Fixed actions tensor:", fixed_actions)
 
-        n_updated_actions = n_samples - n_fixed_actions
-        o_samples2 = torch.unsqueeze(o, 1).repeat(1, n_updated_actions, *([1]*len(o.shape[1:])))
-        o_samples2 = o_samples2.reshape(o_samples2.shape[0] * o_samples2.shape[1], *o_samples2.shape[2:])
-        updated_actions, _ = ac.a(o_samples2)
-        updated_actions = updated_actions.reshape(batch_size, n_updated_actions).unsqueeze(-1)
+        # n_updated_actions = n_samples - n_fixed_actions
+        # o_samples2 = torch.unsqueeze(o, 1).repeat(1, n_updated_actions, *([1]*len(o.shape[1:])))
+        # o_samples2 = o_samples2.reshape(o_samples2.shape[0] * o_samples2.shape[1], *o_samples2.shape[2:])
+        # updated_actions, _ = ac.a(o_samples2)
+        # updated_actions = updated_actions.reshape(batch_size, n_updated_actions).unsqueeze(-1)
 
         # Check values of updated actions tensor
        # print("Updated actions tensor:", updated_actions)
 
-        # flatten first 2 dims to input into network
-        repeat_sizes = [1] * len(o.shape)
-        repeat_sizes[0] *= n_fixed_actions
-        svgd_target_values = ac.q(o.repeat(repeat_sizes), torch.flatten(fixed_actions, end_dim=1))
+        # Duplicate o samples this time for number of fixed actions
+        o_samples2 = torch.unsqueeze(o, 1).repeat(1, n_fixed_actions, *([1]*len(o.shape[1:])))
+        o_samples2 = o_samples2.reshape(o_samples2.shape[0] * o_samples2.shape[1], *o_samples2.shape[2:])
+        svgd_target_values = ac.q(o_samples2, torch.flatten(fixed_actions, end_dim=1))
         svgd_target_values = torch.reshape(svgd_target_values, (o.shape[0], n_fixed_actions, act_dim))
         squash_correction = torch.sum(torch.log(torch.add(torch.neg(torch.square(fixed_actions)), 1 + 1e-6)), dim=-1)
         squash_correction = torch.unsqueeze(squash_correction, dim=-1)
@@ -281,8 +317,7 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
 
         grad_log_p = torch.autograd.grad(log_p, fixed_actions, torch.ones(batch_size, n_fixed_actions, 1), retain_graph=True, allow_unused=True)[0]
         grad_log_p = torch.unsqueeze(grad_log_p, dim=2)
-        grad_log_p.requires_grad = False
-
+        grad_log_p = grad_log_p.detach()
 
 
 
@@ -323,10 +358,26 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
             surrogate_loss += torch.mean(w*w.grad.detach())
             layers += 1
         surrogate_loss /= layers
+        surrogate_loss = torch.neg(surrogate_loss)
 
         ac.a.zero_grad()
 
         return surrogate_loss
+
+    # Set up function for computing SAC pi loss
+    # Just for comparing loss
+    def compute_loss_pi_sac(data):
+        o = data['obs']
+        pi, logp_pi = ac.a(o, with_logprob=True)
+        q_pi = ac.q(o, pi)
+
+        # Entropy-regularized policy loss
+        loss_pi = (alpha * logp_pi - q_pi).mean()
+
+        # Useful info for logging
+        # pi_info = dict(LogPi=logp_pi.detach().numpy())
+
+        return loss_pi
 
     # Set up optimizers for action-sampler and q-function
     q_optimizer = Adam(ac.q.parameters(), lr=lr)
@@ -353,6 +404,17 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
         # Unfreeze Q-networks so you can optimize it at next DDPG step.
         for p in ac.q.parameters():
             p.requires_grad = True
+        
+        # For comparing the loss between SAC and NAC
+        q_optimizer.zero_grad()
+        loss_q_sac = compute_loss_q_sac(data)
+        print("SAC Q: ", loss_q_sac.item())
+        print("NAC Q:", loss_q.item())
+
+        a_optimizer.zero_grad()
+        loss_a_sac = compute_loss_pi_sac(data)
+        print("SAC Pi: ", loss_a_sac.item())
+        print("NAC Pi:", loss_a.item())
 
         # Record things
         # logger.store(LossQ=loss_q.item(), **q_info)
@@ -385,7 +447,7 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
 
     def get_action(o, deterministic=False):
         return ac_targ.act(torch.as_tensor(o, dtype=torch.float32), 
-                      deterministic, alpha)
+                      deterministic, alpha).detach().cpu().numpy()
 
     def test_agent():
         d = False
