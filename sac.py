@@ -209,8 +209,8 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        q_info = dict(Q1Vals=q1.detach().numpy(),
-                      Q2Vals=q2.detach().numpy())
+        q_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                      Q2Vals=q2.detach().cpu().numpy())
 
         return loss_q, q_info
 
@@ -226,7 +226,7 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
         loss_pi = (alpha * logp_pi - q_pi).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().numpy())
+        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
 
         return loss_pi, pi_info
 
