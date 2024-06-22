@@ -1,0 +1,108 @@
+7d6
+< from torch.distributions.categorical import Categorical
+27c26
+< LOG_STD_MIN = -15
+---
+> LOG_STD_MIN = -20
+29,42c28
+< class MLPQFunction(nn.Module):
+< 
+<     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+<         super().__init__()
+<         # self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+<         self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [act_dim], activation)
+< 
+<     def forward(self, obs, act):
+<         q = self.q(torch.cat([obs, act], dim=-1))
+<         # q = self.q(obs)
+<         # return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+<         return q
+< 
+< class MLPActionSampler(nn.Module):
+---
+> class SquashedGaussianMLPActor(nn.Module):
+44c30
+<     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+---
+>     def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
+46d31
+<         # Turns states into a distribution (parameterized by mean and std dev) 
+49a35
+>         self.act_limit = act_limit
+51,52c37
+<     def forward(self, obs, with_logprob=False):
+<         # Get mean and standard deviation
+---
+>     def forward(self, obs, deterministic=False, with_logprob=True):
+59,61c44,50
+<         # Sample from this distribution using rparam trick (adds stochasticity)
+<         dist = Normal(mu, std)
+<         a = dist.rsample()
+---
+>         # Pre-squash distribution and sample
+>         pi_distribution = Normal(mu, std)
+>         if deterministic:
+>             # Only used for evaluating policy at test time.
+>             pi_action = mu
+>         else:
+>             pi_action = pi_distribution.rsample()
+69,70c58,59
+<             logp_pi = dist.log_prob(a).sum(axis=-1)
+<             logp_pi -= (2*(np.log(2) - a - F.softplus(-2*a))).sum(axis=1)
+---
+>             logp_pi = pi_distribution.log_prob(pi_action).sum(axis=-1)
+>             logp_pi -= (2*(np.log(2) - pi_action - F.softplus(-2*pi_action))).sum(axis=1)
+74,82c63,64
+<         # # sample from standard normal distribution (array of length batchsize)
+<         # batch_size = obs.shape[0] if len(obs.shape) > 1 else 1
+<         # nml = torch.normal(torch.zeros(batch_size), torch.ones(batch_size))
+<         # nml.requires_grad = False
+<         
+<         # # feed both observation and normal dist. sample into network
+<         # a = self.a(torch.cat([obs, nml], dim=-1))
+<         # bound action values between -1 and 1
+<         a = torch.tanh(a)
+---
+>         pi_action = torch.tanh(pi_action)
+>         pi_action = self.act_limit * pi_action
+84c66,77
+<         return a, logp_pi
+---
+>         return pi_action, logp_pi
+> 
+> 
+> class MLPQFunction(nn.Module):
+> 
+>     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+>         super().__init__()
+>         self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+> 
+>     def forward(self, obs, act):
+>         q = self.q(torch.cat([obs, act], dim=-1))
+>         return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+88c81
+<     def __init__(self, obs_dim, act_dim, hidden_sizes=(256,256),
+---
+>     def __init__(self, observation_space, action_space, hidden_sizes=(256,256),
+92,94c85,92
+<         # build q function and action sampling function
+<         self.q = MLPQFunction(obs_dim[0], act_dim[0], hidden_sizes, activation)
+<         self.a = MLPActionSampler(obs_dim[0], act_dim[0], hidden_sizes, nn.ReLU)
+---
+>         obs_dim = observation_space.shape[0]
+>         act_dim = action_space.shape[0]
+>         act_limit = action_space.high[0]
+> 
+>         # build policy and value functions
+>         self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
+>         self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+>         self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+96c94
+<     def act(self, obs, deterministic=False, alpha=0.2):
+---
+>     def act(self, obs, deterministic=False):
+98,99c96
+<             # sample an action
+<             a, _ = self.a(obs)
+---
+>             a, _ = self.pi(obs, deterministic, False)

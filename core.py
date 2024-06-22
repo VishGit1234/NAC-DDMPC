@@ -1,11 +1,9 @@
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 from torch.distributions.categorical import Categorical
-
 
 def combined_shape(length, shape=None):
     if shape is None:
@@ -30,14 +28,13 @@ class MLPQFunction(nn.Module):
 
     def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
         super().__init__()
-        # self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [act_dim], activation)
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
 
     def forward(self, obs, act):
         q = self.q(torch.cat([obs, act], dim=-1))
         # q = self.q(obs)
-        # return torch.squeeze(q, -1) # Critical to ensure q has right shape.
-        return q
+        return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+        # return torch.squeeze(q,-1)
 
 class MLPActionSampler(nn.Module):
 
@@ -93,8 +90,12 @@ class MLPActorCritic(nn.Module):
         self.q = MLPQFunction(obs_dim[0], act_dim[0], hidden_sizes, activation)
         self.a = MLPActionSampler(obs_dim[0], act_dim[0], hidden_sizes, nn.ReLU)
 
-    def act(self, obs, deterministic=False, alpha=0.2):
+    def act(self, obs, alpha=0.2):
         with torch.no_grad():
             # sample an action
             a, _ = self.a(obs)
             return a
+        
+        
+
+

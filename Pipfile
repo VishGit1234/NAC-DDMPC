@@ -1,0 +1,14 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+torch = "*"
+stable-baselines3 = "*"
+gymnasium = {extras = ["mujoco", "classic-control"], version = "*"}
+
+[dev-packages]
+
+[requires]
+python_version = "3.12.4"

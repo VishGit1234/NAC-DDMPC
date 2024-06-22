@@ -1,2 +1,3 @@
-gymnasium[classic-control]
+gymnasium[classic-control, mujoco]
 torch
+stable_baselines3

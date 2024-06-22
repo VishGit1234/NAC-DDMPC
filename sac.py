@@ -149,7 +149,8 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
     """
 
     # logger = EpochLogger(**logger_kwargs)
-    # logger.save_config(locals())
+    # logger.save_config(locals()
+                        # TODO: implement demonstrations)
     
 
     torch.manual_seed(seed)
@@ -278,6 +279,7 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
                       deterministic).detach().cpu().numpy()
 
     def test_agent():
+        d = False
         for j in range(num_test_episodes):
             o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
             o = o[0]
@@ -287,7 +289,7 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
                 ep_ret += r
                 ep_len += 1
             # logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
-        return ep_ret, ep_len
+        return ep_ret, ep_len, d
 
     # test_agent()
     # return
@@ -351,8 +353,8 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
 
             # Test the performance of the deterministic version of the agent.
             # Test the performance of the deterministic version of the agent.
-            ep_ret, ep_len = test_agent()
-            print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_ret}")
+            ep_ret, ep_len, d = test_agent()
+            print(f"Epoch: {epoch}, Ep Len: {ep_len}, Ep Retu: {ep_ret} finished: {d}")
             ep_ret, ep_len = np.zeros((num_envs,)), np.zeros((num_envs,))
 
             # Log info about epoch
@@ -369,7 +371,7 @@ def sac(num_envs, env_fn, actor_critic=sac_core.MLPActorCritic, ac_kwargs=dict()
             # logger.log_tabular('LossQ', average_only=True)
             # logger.log_tabular('Time', time.time()-start_time)
             # logger.dump_tabular()
-
+    return ac
 # if __name__ == '__main__':
 #     import argparse
 #     parser = argparse.ArgumentParser()

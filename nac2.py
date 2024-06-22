@@ -118,7 +118,6 @@ class MLPActorCritic(nn.Module):
         
 
 #action sampler should be identical to SAC
-def loss_pi_0(batch, ac,ac_targ, alpha, gamma):
 
 def loss_pi_1(batch, ac, ac_targ, alpha, gamma):
     o = batch['obs']
@@ -351,7 +350,7 @@ def nac(env_fn, steps,  start_steps, update_every, alpha=0.4, gamma=0.99, lr=1e-
         lq = update_loss_Jv(batch, ac, ac_targ ,alpha, gamma, q_optim)
         lq = update_loss_Jpg(batch, ac, ac_targ, alpha, gamma, q_optim)
         pi_optim.zero_grad()
-        lpi, _ = loss_pi_0(batch, ac, ac_targ, alpha, gamma)
+        lpi, _ = loss_pi_1(batch, ac, ac_targ, alpha, gamma)
         lpi.backward()
         pi_optim.step()
 

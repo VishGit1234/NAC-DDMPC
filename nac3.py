@@ -161,7 +161,8 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
     test_env = env_fn()
     envs = SubprocVecEnv([env_fn for _ in range(num_envs)])
     obs_dim = envs.observation_space.shape
-    act_dim = envs.action_space.shape
+    act_dim = envs.action_space.shape[0]
+
     if not realtime:
         envs.set_attr('render_fps', 0)#['render_fps'] = 0
 
@@ -398,7 +399,7 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
             p.requires_grad = False
         loss_a = compute_loss_a(data)
         loss_a.backward()
-        # q_optimizer.step()
+        q_optimizer.step()
         a_optimizer.step()
         # Unfreeze Q-networks so you can optimize it at next DDPG step.
         for p in ac.q.parameters():
@@ -513,7 +514,6 @@ def nac(num_envs, env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), se
                     if t > start_steps:
                         batch = replay_buffer.sample_batch(batch_size)
                     else:
-                        # TODO: implement demonstrations
                         # batch = demonstrations.sample_batch(batch_size)
                         batch = replay_buffer.sample_batch(batch_size)
                     update(data=batch)
