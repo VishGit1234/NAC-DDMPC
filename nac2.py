@@ -1,17 +1,16 @@
-from copy import deepcopy
-import itertools
 import numpy as np
-import torch
-from torch.optim import Adam
-import core
-import math
-# import gym
-import time
-from timeit import default_timer
 
-from kernel import adaptive_isotropic_gaussian_kernel
-# import spinup.algos.pytorch.sac.core as core
-# from spinup.utils.logx import EpochLogger
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.normal import Normal
+from torch.distributions.categorical import Categorical
+from math import prod
+import itertools
+
+def combined_shape(s1, s2):
+
+    return s1 + s2
 
 
 class ReplayBuffer:
@@ -19,10 +18,10 @@ class ReplayBuffer:
     A simple FIFO experience replay buffer for SAC agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size):
-        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
-        self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(core.combined_shape(size, 1), dtype=np.float32)
+    def __init__(self, obs_dim: int, act_dim: int, size : int):
+        self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
+        self.obs2_buf = np.zeros((size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros((size, act_dim), dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.done_buf = np.zeros(size, dtype=np.float32)
         self.ptr, self.size, self.max_size = 0, 0, size
@@ -46,389 +45,350 @@ class ReplayBuffer:
         return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
 
 
+def mlp(sizes, activation=nn.ReLU, output_activation=nn.Identity):
+    layers = []
+    for j in range(len(sizes)-1):
+        act = activation if j < len(sizes)-2 else output_activation
+        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
+    return nn.Sequential(*layers)
+
+def count_vars(module):
+    return sum(np.prod(p.shape) for p in module.parameters())
+
+
+class MLPQfunction(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation=nn.ReLU):
+        super().__init__()
+        self.q = mlp([obs_dim + act_dim] + hidden_sizes + [1], activation)
+
+    def forward(self, obs, act):
+        return self.q(torch.cat([obs, act], dim=-1))
+
+
+LOG_STD_MAX = 3
+LOG_STD_MIN = -15
+
+class MLPActionSampler(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+        super().__init__()
+        self.net = mlp([obs_dim] + hidden_sizes, activation)
+        self.mu_layer = nn.Linear(hidden_sizes[-1], act_dim)
+        self.log_std_layer = nn.Linear(hidden_sizes[-1], act_dim)
+
+    def forward(self, obs, is_determinstic = False, with_logprob=True):
+        net_out = self.net(obs)
+
+        mu = self.mu_layer(net_out)
+        log_std = self.log_std_layer(net_out)
+        log_std = torch.clamp(log_std,LOG_STD_MIN, LOG_STD_MAX)
+        std = torch.exp(log_std)
+        dist = Normal(mu, std)
+
+
+        if(is_determinstic):
+            return mu
+
+        a = dist.rsample()
+        if with_logprob:
+            logp_a = dist.log_prob(a).sum(axis=-1)
+            logp_a -= (2*(np.log(2) - a - F.softplus(-2*a))).sum()
+            logp_a = logp_a.squeeze()
+        else:
+            logp_a = None
+
+        return torch.tanh(a), logp_a
 
 
 
+class MLPActorCritic(nn.Module):
 
-def nac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=5, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.9, lr=1e-5, alpha=0.2, batch_size=200, start_steps=10000, 
-        update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, realtime=False, savedir= "./Models/"):
-    """
-    Soft Actor-Critic (SAC)
+    def __init__(self, obs_dim, act_dim, act_low, act_high, hidden_sizes=[32,32], activation=nn.ReLU):
+        super().__init__()
+        self.act_low = act_low
+        self.act_high = act_high
+
+        # build q function and action sampling function
+        self.q = MLPQfunction(obs_dim, act_dim, hidden_sizes, activation)
+        self.pi = MLPActionSampler(obs_dim, act_dim, hidden_sizes, activation)
+
+    def act(self, obs, deterministic=False):
+        with torch.no_grad():
+            # sample an action
+            return self.pi(obs, is_determinstic = deterministic , with_logprob=False)
+        
+
+#action sampler should be identical to SAC
+def loss_pi_0(batch, ac,ac_targ, alpha, gamma):
+
+def loss_pi_1(batch, ac, ac_targ, alpha, gamma):
+    o = batch['obs']
+    pi, logp_pi = ac.pi(o)
+    q_pi = ac.q(o, pi)
+
+    # Entropy-regularized policy loss
+    loss_pi = (alpha * logp_pi - q_pi).square().mean()
+
+    # Useful info for logging
+    pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
+
+    return loss_pi, pi_info
 
 
-    Args:
-        env_fn : A function which creates a copy of the environment.
-            The environment must satisfy the OpenAI Gym API.
 
-        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
-            method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
-            The ``act`` method and ``pi`` module should accept batches of 
-            observations as inputs, and ``q1`` and ``q2`` should accept a batch 
-            of observations and a batch of actions as inputs. When called, 
-            ``act``, ``q1``, and ``q2`` should return:
+def uniform_sample(shape,low,high):
 
-            ===========  ================  ======================================
-            Call         Output Shape      Description
-            ===========  ================  ======================================
-            ``act``      (batch, act_dim)  | Numpy array of actions for each 
-                                           | observation.
-            ``q1``       (batch,)          | Tensor containing one current estimate
-                                           | of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ``q2``       (batch,)          | Tensor containing the other current 
-                                           | estimate of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ===========  ================  ======================================
 
-            Calling ``pi`` should return:
 
-            ===========  ================  ======================================
-            Symbol       Shape             Description
-            ===========  ================  ======================================
-            ``a``        (batch, act_dim)  | Tensor containing actions from policy
-                                           | given observations.
-            ``logp_pi``  (batch,)          | Tensor containing log probabilities of
-                                           | actions in ``a``. Importantly: gradients
-                                           | should be able to flow back into ``a``.
-            ===========  ================  ======================================
+    sample = torch.rand(combined_shape(shape, low.shape))
+    sample = sample.mul(torch.tensor(high)- torch.tensor(low))
+    sample = sample.add(torch.tensor(low))
 
-        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to SAC.
+    return sample
 
-        seed (int): Seed for random number generators.
 
-        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
-            for the agent and the environment in each epoch.
 
-        epochs (int): Number of epochs to run and train agent.
+ #Expects flattened observations and actions
+def update_loss_Jv(batch, ac, ac_targ ,alpha, gamma, q_optim, n_samples = 128, ):
+    o, a, r, o2, d = batch['obs'], batch['act'], batch['rew'], batch['obs2'], batch['done']
 
-        replay_size (int): Maximum length of replay buffer.
 
-        gamma (float): Discount factor. (Always between 0 and 1.)
+    batch_size = o.shape[0]
+    obs_dim = o.shape[1]
+    act_dim  = a.shape[1]
 
-        polyak (float): Interpolation factor in polyak averaging for target 
-            networks. Target networks are updated towards main networks 
-            according to:
-
-            .. math:: \\theta_{\\text{targ}} \\leftarrow 
-                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
-
-            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
-            close to 1.)
-
-        lr (float): Learning rate (used for both policy and value learning).
-
-        alpha (float): Entropy regularization coefficient. (Equivalent to 
-            inverse of reward scale in the original SAC paper.)
-
-        batch_size (int): Minibatch size for SGD.
-
-        start_steps (int): Number of steps for uniform-random action selection,
-            before running real policy. Helps exploration.
-
-        update_after (int): Number of env interactions to collect before
-            starting to do gradient descent updates. Ensures replay buffer
-            is full enough for useful updates.
-
-        update_every (int): Number of env interactions that should elapse
-            between gradient descent updates. Note: Regardless of how long 
-            you wait between updates, the ratio of env steps to gradient steps 
-            is locked to 1.
-
-        num_test_episodes (int): Number of episodes to test the deterministic
-            policy at the end of each epoch.
-
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
-
-        save_freq (int): How often (in terms of gap between epochs) to save
-            the current policy and value function.
-
-        realtime (bool): Wheather to run the simulation in realtime or not, (set to false for faster training)
-
-    """
-
-    # logger = EpochLogger(**logger_kwargs)
-    # logger.save_config(locals())
     
+    #compute o state value by sampling from action space
+    o_samples = o.unsqueeze(1).repeat(1, n_samples,1)#shape should be (n_samples, batch_size, obs_dim)
+    assert o_samples.shape == (batch_size, n_samples, obs_dim)
+    a_samples = uniform_sample((batch_size, n_samples), ac.act_low, ac.act_high)#shape should be (batch_size, n_samples, act_dim)
+    assert a_samples.shape == (batch_size, n_samples, act_dim)
+    #compute sample q values, q(. , s)
+    q1_samples = ac.q(o_samples, a_samples).squeeze() # q1 has shape (batch_size, n_samples)
+    assert q1_samples.shape == (batch_size, n_samples)
+    v1 = (alpha* torch.logsumexp(q1_samples/alpha, dim=1)).squeeze()#v1 has shape (batch_size)
+    
+    v1_samples = v1.unsqueeze(1).repeat(1, n_samples)
+    #independent sample for q
+    a_samples2 = uniform_sample((batch_size, n_samples), ac.act_low, ac.act_high)
+    q1_samples = ac.q(o_samples, a_samples2).squeeze()
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    pi_samples = torch.exp((q1_samples-v1_samples)/alpha)
 
-    env, test_env = env_fn(), env_fn()
-    #uncap env fps
+    ent_sa = 0
+    #assert ent_sa.shape == (batch_size, )
+    #assert ent_sa > 0
+    
+    #Compute V hat 
+    o2_samples = o2.unsqueeze(1).repeat(1, n_samples,1)#shape should be (n_samples, batch_size, obs_dim)
+    #assert o2_samples.shape == (batch_size, n_samples, obs_dim)
+    a2_samples = uniform_sample((batch_size, n_samples), ac.act_low, ac.act_high) #shape should be (n_samples, batch_size, act_dim)
+    #assert a2_samples.shape == (batch_size, n_samples , act_dim)
+    q2_samples = ac.q(o2_samples, a2_samples) # q1 has shape (batch_size)
+    #assert q2.shape == (batch_size, n_samples,1)
+    v2 = alpha* torch.logsumexp(q2_samples/alpha, dim=1).squeeze() #v1 has shape (batch_size)
+    #assert v2.shape == (batch_size,)
+
+    #a2, logp_a2 = ac_targ.pi(o2)
+    v_hat = r + gamma*v2  + alpha*ent_sa
+
+
+    J_v = 0.5*(v1-v_hat).square().mean()
+    J_v.backward()
+    q_optim.step()
+    q_optim.zero_grad()
+    return J_v
+
+
+def update_loss_Jpg(batch, ac, ac_targ, alpha, gamma, q_optim, n_samples = 128, ):
+    o, a, r, o2, d = batch['obs'], batch['act'], batch['rew'], batch['obs2'], batch['done']
+    batch_size = o.shape[0]
+    obs_dim = o.shape[1]
+    act_dim  = a.shape[1]
+    #policy gradient loss
+    o_samples = o.unsqueeze(1).repeat(1, n_samples,1)#shape should be (n_samples, batch_size, obs_dim)
+    assert o_samples.shape == (batch_size, n_samples, obs_dim)
+    a_samples = uniform_sample((batch_size, n_samples), ac.act_low, ac.act_high)#shape should be (batch_size, n_samples, act_dim)
+    assert a_samples.shape == (batch_size, n_samples, act_dim)
+    #compute sample q values, q(. , s)
+    q1_samples = ac.q(o_samples, a_samples).squeeze() # q1 has shape (batch_size, n_samples)
+    assert q1_samples.shape == (batch_size, n_samples)
+    v1 = (alpha* torch.logsumexp(q1_samples/alpha, dim=1)).squeeze()#v1 has shape (batch_size)
+    #loss for jpg
+    q_sa = ac.q(o,a).squeeze()
+    
+    J_pg = (q_sa - v1).sum()
+    #after this step, ac.q should have gradients mean(grad_theta(q_sa-v1))
+    J_pg.backward()
+
+
+    with torch.no_grad():
+        ##COMPUTE Q HAT USING TARGET NETWORK
+        o2_samples = o.unsqueeze(1).repeat(1, n_samples,1)
+        a_samples = uniform_sample((batch_size, n_samples), ac.act_low, ac.act_high)#shape should be (batch_size, n_samples, act_dim)
+        q2_samples = ac_targ.q(o2_samples, a_samples)
+        v2 = alpha*torch.logsumexp(q2_samples/alpha, dim=1).squeeze()
+        q_hat = r + gamma*v2
+        q_minus_qhat = q_sa - q_hat
+
+        for p in ac.q.parameters():
+            #print(p.grad)
+            g1 = p.grad.unsqueeze(0).repeat((batch_size, ) + tuple(1 for i in p.grad.shape) )
+            #g1 has shape (*p.grad.shape, batch_size)
+            assert g1.shape ==  combined_shape((batch_size,), p.grad.shape)
+            
+            coif = q_minus_qhat.reshape((batch_size,) + tuple(1 for i in p.grad.shape))
+
+
+            p.grad = (g1*coif).sum(axis=0)
+    q_optim.step()
+    q_optim.zero_grad()
+    return q_minus_qhat.square().mean()
+
+
+def test_agent(ac, test_env):
+    f = 0.0
+    for j in range(3):
+        o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+        o = o[0]
+        while not(d or (ep_len == 200)):
+            # Take deterministic actions at test time
+            o, r, d, _, _ = test_env.step(ac.act(torch.tensor(o, dtype=torch.float32), deterministic=True).numpy())
+            ep_ret += r
+            ep_len += 1
+        # logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        f += 1.0 if d else 0
+    return ep_ret, ep_len, f/3
+
+
+def sample_demos(env_fn, steps):
+    env = env_fn()
+    env.metadata["render_fps"]= 0
+    obs_dim = prod(i for i in env.observation_space.shape)
+    act_dim = prod(i for i in env.action_space.shape)
+    demo_buffer = ReplayBuffer(obs_dim, act_dim, steps)
+
+
+    o, _ = env.reset()
+    for t in range(steps):
+        a = env.action_space.sample()
+        o2,r,d,_,_ = env.step(a)
+        demo_buffer.store(o,a,r,o2,d)
+        o = o2
+        if(d):
+            o, _ = env.reset()
+
+    return demo_buffer
+
+
+def nac(env_fn, steps,  start_steps, update_every, alpha=0.4, gamma=0.99, lr=1e-5, realtime=False, actor_critic = MLPActorCritic, buffer_size=10000, batch_size=64, demo_steps = 2000, polyak = 0, report_every = 2000, sac_ac= None):
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    env = env_fn()
+
+
+
+    obs_dim = int( prod(i for i in env.observation_space.shape))
+    act_dim = int(prod(i for i in env.action_space.shape))
 
     if not realtime:
-        env.metadata['render_fps'] = 0
+        env.metadata["render_fps"]= 0
+
+    ac = actor_critic(obs_dim, act_dim, env.action_space.low, env.action_space.high)
+    ac_targ = actor_critic(obs_dim, act_dim, env.action_space.low, env.action_space.high)
+    ac_targ.requires_grad_ = False
 
 
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    # act_dim = env.action_space.n
-
-    # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    act_high = env.action_space.high[0]
-    act_low = env.action_space.low[0]
-
-    # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space.shape, **ac_kwargs)
-    ac_targ = deepcopy(ac)
-
-    torch.autograd.set_detect_anomaly(True)
-
-    # Freeze target networks with respect to optimizers (only update via polyak averaging)
-    for p in ac_targ.parameters():
-        p.requires_grad = False
-        
-    # List of parameters for both networks
-    # q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
-
-    # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
-    demonstrations = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=start_steps)
-
-
-
-    # Count variables (protip: try to get a feel for how different size networks behave!)
-    # var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
-    # logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
-
-    # Set up function for computing SAC Q-losses
-    def compute_loss_q(data):
-        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-
-        # Calculate value for each state in mini-batch using importance sampling derived formula
-        n_samples = batch_size # Number of samples for sample mean
-        o_samples = torch.unsqueeze(o, 1).repeat(1, n_samples, *([1]*len(o.shape[1:])))
-        o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
-        a_samples, _ = ac.a(o_samples)
-        q_samples = ac.q(o_samples, a_samples)
-        # Reshape to B x num_samples
-        q_samples = q_samples.reshape(batch_size, n_samples)
-
-        # Compute values of current states (I think dividing by q_ai(ai) can be ignored)
-        # alpha*(LSE(q/a) - log(N))
-        # Using torch operations for differentiability
-        v = torch.mul(torch.sub(torch.logsumexp(q_samples/alpha, dim=1), math.log(n_samples)), alpha)
-
-        # Get q-value estimates for all state-action pairs in mini-batch
-        q = ac.q(o, a)
-
-        # Compute Q target and V target
-        with torch.no_grad():
-            o2_samples = torch.unsqueeze(o2, 1).repeat(1, n_samples, *([1]*len(o2.shape[1:])))
-            o2_samples = o2_samples.reshape(o2_samples.shape[0] * o2_samples.shape[1], *o2_samples.shape[2:])
-            a_samples2, logps = ac.a(o2_samples, True)
-            logps = logps.reshape(batch_size, n_samples)
-            q_samples2 = ac.q(o2_samples, a_samples2)
-            q_samples2 = q_samples2.reshape(batch_size, n_samples)
-
-            # Compute value of next state
-            v2 = torch.logsumexp(q_samples2/alpha, dim=1)
-            v2 -= math.log(n_samples)
-            v2 *= alpha
-
-            # Compute targets
-            q_targ = torch.unsqueeze(r, dim=-1) + gamma*v2
-            v_targ = q_samples2.mean(dim=1) + alpha*torch.unsqueeze(logps.mean(dim=1), dim=-1)
-
-        # Calculate gradients
-        policy_grad = ((q - v)*(q - q_targ)).mean(dim=-1)
-        v_grad = torch.div(torch.square(v - v_targ), 2).mean(dim=-1)
-        #loss_q = -(policy_grad + v_grad)
-
-        loss_q = (policy_grad + v_grad)
-        return torch.mean(loss_q)
-
-    # Set up function for computing SAC actor loss
-    def compute_loss_a(data):
-        o = data['obs']
-
-        n_samples = 8
-        n_fixed_actions = n_samples // 2
-        fixed_actions = []
-        o_samples = torch.unsqueeze(o, 1).repeat(1, n_fixed_actions, *([1]*len(o.shape[1:])))
-        o_samples = o_samples.reshape(o_samples.shape[0] * o_samples.shape[1], *o_samples.shape[2:])
-        fixed_actions, _ = ac.a(o_samples)
-        fixed_actions = fixed_actions.reshape(batch_size, n_fixed_actions).unsqueeze(-1)
-
-        n_updated_actions = n_samples - n_fixed_actions
-        o_samples2 = torch.unsqueeze(o, 1).repeat(1, n_updated_actions, *([1]*len(o.shape[1:])))
-        o_samples2 = o_samples2.reshape(o_samples2.shape[0] * o_samples2.shape[1], *o_samples2.shape[2:])
-        updated_actions, _ = ac.a(o_samples2)
-        updated_actions = updated_actions.reshape(batch_size, n_updated_actions).unsqueeze(-1)
-
-        # flatten first 2 dims to input into network
-        repeat_sizes = [1] * len(o.shape)
-        repeat_sizes[0] *= n_fixed_actions
-        svgd_target_values = ac.q(o.repeat(repeat_sizes), torch.flatten(fixed_actions, end_dim=1))
-        svgd_target_values = torch.reshape(svgd_target_values, (o.shape[0], n_fixed_actions, act_dim))
-        squash_correction = torch.sum(torch.log(torch.add(torch.neg(torch.square(fixed_actions)), 1 + 1e-6)), dim=-1)
-        squash_correction = torch.unsqueeze(squash_correction, dim=-1)
-        log_p = svgd_target_values + squash_correction
-        
-        grad_log_p = torch.autograd.grad(log_p, fixed_actions, torch.ones(batch_size, n_fixed_actions, 1), retain_graph=True)[0]
-        grad_log_p = torch.unsqueeze(grad_log_p, dim=2)
-        grad_log_p.requires_grad = False
-
-        kernel_dict = adaptive_isotropic_gaussian_kernel(xs=fixed_actions, ys=updated_actions)
-
-        # Kernel function in Equation 13:
-        kappa = torch.unsqueeze(kernel_dict["output"], dim=3)
-
-        # Stein Variational Gradient in Equation 13:
-        action_gradients = torch.mean(
-            kappa * grad_log_p + kernel_dict["gradient"], dim=1)
-
- 
-        updated_actions.backward(action_gradients, retain_graph = True)
-
-        # Calculate surrogate loss
-        surrogate_loss = 0
-        layers = 0
-        for w in ac.a.parameters():
-            surrogate_loss += torch.mean(w*w.grad.detach())
-            layers += 1
-        surrogate_loss /= layers
-
-       
-
-        return surrogate_loss
-     
-
-
-    # Set up model saving
-    # logger.setup_pytorch_saver(ac)
+    demo_buffer = sample_demos(env_fn, demo_steps)
+    replay_buffer = ReplayBuffer(obs_dim, act_dim, buffer_size)
     
-    # Set up optimizers for action-sampler and q-function
-    q_optimizer = Adam(ac.q.parameters(), lr=lr)
-    a_optimizer = Adam(ac.a.parameters(), lr=lr)
+    q_optim = torch.optim.Adam(ac.q.parameters(), lr)
+    pi_optim = torch.optim.Adam(ac.pi.parameters(), lr)
 
-    def update(data):
-        # First run one gradient descent step for Q and A
-        q_optimizer.zero_grad()
-        a_optimizer.zero_grad()
-        loss_q = compute_loss_q(data)
-        loss_q.backward()
-        loss_a = compute_loss_a(data)
-        #print(loss_a)
-        loss_a.backward()
-        q_optimizer.step()
-        a_optimizer.step()
+    ep_ret = 0
 
-        # Finally, update target networks by polyak averaging.
-    
-    def get_action(o, deterministic=False):
-        return ac_targ.act(torch.as_tensor(o, dtype=torch.float32), 
-                      deterministic, alpha)
+    print("finished sampling")
 
-    def test_agent():
-        test_ret = 0
-        reach_total = 0
-        for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            o = o[0]
-            while not(d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time 
-                o, r, d, _, _ = test_env.step(get_action(o, True))
-                ep_ret += r
-                ep_len += 1
+    o, _ = env.reset()
 
-            test_ret += ep_ret
-            reach_total += 1 if d else 0
-         
-            # logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
-        return test_ret, reach_total/float(num_test_episodes)
+    o = torch.tensor(o, dtype=torch.float32)
+    for t in range(steps):
+
+        action_batch=32
+
+        a, _ = ac.act(o)
+        if t%500 == 0:
+            q_nac = ac.q(o,a)
+            q_sac = sac_ac.q1(o,a)
+
+            s_act = sac_ac.act(o)
+            n_act = ac.act(o)
+
+            #print(o,  q_samples1, s_act)
             
-    def train():
-        # Main loop: collect experience in env and update/log each epoch
+            print(f"{o}, sac act:{s_act} nac act:{n_act}, nac q {q_nac}, sac q {q_sac}")      
 
-        t = 0
-        e = 0
-        for _ in range(epochs):
-    
+
+
+        o2, r, d, _, _ = env.step(a.cpu())
+        replay_buffer.store(o.flatten(),a.flatten(),r,o2,d)
+        o = o2
+        o = torch.tensor(o, dtype=torch.float32)
+        
+        
+
+
+        if(d):
             o, _ = env.reset()
-            ep_ret = 0
+
+        if(t < start_steps):
+            batch = demo_buffer.sample_batch(batch_size)
+        else:
+            batch = replay_buffer.sample_batch(batch_size)
+
+        #update fast response
+        q_optim.zero_grad()
+        lq = update_loss_Jv(batch, ac, ac_targ ,alpha, gamma, q_optim)
+        lq = update_loss_Jpg(batch, ac, ac_targ, alpha, gamma, q_optim)
+        pi_optim.zero_grad()
+        lpi, _ = loss_pi_0(batch, ac, ac_targ, alpha, gamma)
+        lpi.backward()
+        pi_optim.step()
 
 
-            for _ in range(steps_per_epoch):
-                for _ in range(max_ep_len):
-                    a = get_action(o)
-                    o2, r, d, _, _ = env.step(a)
-                    ep_ret += r
-                    t+=1
-                    replay_buffer.store(o, a, r, o2, d)
-                    o = o2
-                    # update fast response network
+  
+        #update slow response
+        if t% update_every == 0:
 
-                    if t > start_steps:
-                        batch = replay_buffer.sample_batch(batch_size)
-                    else:
-                        batch = demonstrations.sample_batch(batch_size)
             
-                    update(batch)
-                    #update target network with polyak avg
-                    if( t % update_every == 0):
-                        with torch.no_grad():
-                            for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
-                                # NB: We use an in-place operations "mul_", "add_" to update target
-                                # params, as opposed to "mul" and "add", which would make new tensors.
-                                p_targ.data.mul_(polyak)
-                                p_targ.data.add_((1 - polyak) * p.data)
-
+            with torch.no_grad():
+                for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+                # NB: We use an in-place operations "mul_", "add_" to update target
+                # params, as opposed to "mul" and "add", which would make new tensors.
+                    p_targ.data.mul_(polyak)
+                    p_targ.data.add_((1 - polyak) * p.data)
                     
-                    if(d):
-                        break
-                
-            ep_ret,d1  = test_agent()   
-            print(f"finished trajectory, score: {ep_ret}, target reached ratio: {d1}") 
+                    #assert torch.isclose(p_targ, p).all()
+
+                    #print(p_targ)
+
+        
+        if t% report_every == 0:
+            ep_ret, ep_len, d = test_agent(ac, env)
+            lpi = 0
+            print(f"epoch: {t//report_every} epoch length: {report_every}, ep_len: {ep_len}, ep_ret: {ep_ret} finished: {d}, loss q: {lq}, loss pi: {lpi}")
 
 
-    #fill up demonstration buffer
-    t = 0
-    while t < start_steps:
-        a = env.action_space.sample()
+    return ac
 
-        o, _ = env.reset()
-        o2 = o
+import gymnasium as gym
+from sac import sac
+import sac_core
 
-        for _ in range(max_ep_len):
-            o2, r, d, _, _ = env.step(a)
-            t+=1
-            demonstrations.store(o, a, r, o2, d)
-            if(d):
-                o, _ = env.reset()
-                o2 = o
-            o = o2
-    print("FINISHED SAMPLING DEMONSTRATIONS")
+if __name__ == '__main__':
+    torch.set_default_device('cpu')
+    
 
-
-    train()
-
-# if __name__ == '__main__':
-#     import argparse
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--env', type=str, default='HalfCheetah-v2')
-#     parser.add_argument('--hid', type=int, default=256)
-#     parser.add_argument('--l', type=int, default=2)
-#     parser.add_argument('--gamma', type=float, default=0.99)
-#     parser.add_argument('--seed', '-s', type=int, default=0)
-#     parser.add_argument('--epochs', type=int, default=50)
-#     parser.add_argument('--exp_name', type=str, default='sac')
-#     args = parser.parse_args()
-
-#     # from spinup.utils.run_utils import setup_logger_kwargs
-#     # logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
-
-#     torch.set_num_threads(torch.get_num_threads())
-
-#     sac(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
-#         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
-#         gamma=args.gamma, seed=args.seed, epochs=args.epochs)
+    ac_sac = sac(num_envs=8, env_fn=lambda : gym.make("Pendulum-v1", render_mode=None), actor_critic=sac_core.MLPActorCritic, realtime=False, start_steps=10000, replay_size=1000000, update_every=50, update_after=10000, batch_size=256, steps_per_epoch=5000, max_ep_len=200, num_test_episodes=1, lr=1e-3, epochs=1)
+    ac_nac = nac(env_fn=lambda : gym.make("Pendulum-v1", render_mode=None), steps=100000, start_steps=8000,update_every=50, 
+        alpha=0.2, gamma=0.99, lr=1e-3, realtime=False, actor_critic = MLPActorCritic, buffer_size=100000, batch_size=100, demo_steps = 10000, polyak = 0.995, report_every = 2000, sac_ac=ac_sac) 
